@@ -1,0 +1,19 @@
+molecules: ["Heptazine", "Cyclazine", "Molecule3"]
+geometry_file: geometries.txt
+parameters:
+  a1: [0.45, 0.55]
+  b1: [-0.28, -0.18]
+  a2: [0.60, 0.75]
+  b2: [-0.12, -0.08]
+reference_values:
+  S1:
+    Heptazine: 2.717
+    Cyclazine: 0.979
+  T1:
+    Heptazine: 2.936
+    Cyclazine: 1.110
+optimization:
+  max_jobs: 20
+  algorithm: tpe
+  max_evals: 250
+
