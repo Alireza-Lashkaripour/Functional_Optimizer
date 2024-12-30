@@ -4,6 +4,7 @@ import os
 import subprocess
 import math
 import csv
+import re
 from time import sleep
 from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
 import yaml
@@ -34,30 +35,47 @@ class JobManager:
 
     def generate_input_files(self, molecule, params, state):
         """Generate input files for each molecule."""
-        state_dir = f"a1_{params['a1']}_b1_{params['b1']}_a2_{params['a2']}_b2_{params['b2']}_{state}"
+
+        a1 = f"{params['a1']:.2f}"
+        b1 = f"{params['b1']:.2f}"
+        a2 = f"{params['a2']:.2f}"
+        b2 = f"{params['b2']:.2f}"
+
+        state_dir = f"a1_{a1}_b1_{b1}_a2_{a2}_b2_{b2}_{state}"
         if not os.path.exists(state_dir):
             os.makedirs(state_dir)
-        
+            
         inp_file = os.path.join(state_dir, f"{molecule}_{state_dir}.inp")
         try:
             command = f'./gen_geo.sh {molecule} {self.geometry_file}'
-            geom_data = subprocess.check_output(command, shell=True).decode()
+            geom_data = subprocess.check_output(command, shell=True).decode().strip()
+            
             with open(inp_file, 'w') as f:
-             f.write(f""" $CONTRL SCFTYP=ROHF RUNTYP=energy DFTTYP=camb3lyp
- ICHARG=0 TDDFT=MRSF MAXIT=200 
- MULT=3 ISPHER=0 UNITS=BOHR $END
- $TDDFT NSTATE=3 IROOT=1 MULT={'1' if state == 'S' else '3'} 
- mralp={params['a2']} mrbet={params['b2']} $END
+                f.write(f""" $CONTRL SCFTYP=ROHF RUNTYP=energy DFTTYP=camb3lyp ICHARG=0
+ TDDFT=MRSF MAXIT=200 MULT=3 ISPHER=0 UNITS=BOHR $END
+ $TDDFT NSTATE=3 IROOT=1 MULT={'1' if state == 'S' else '3'} mralp={a2} mrbet=0.30 $END
  $TDDFT spcp(1)=0.5,0.5,0.5 $END
- $DFT alphac={params['a1']} betac={params['b1']} $END
- $SCF DIRSCF=.t. diis=.f. damp=.t. soscf=.f. shift=.t.
- FDIFF=.t. $END
+ $DFT alphac={a1} betac={b1} $END
+ $SCF DIRSCF=.t. diis=.f. damp=.t.
+  soscf=.f. shift=.t. FDIFF=.t.
+ couple=.t. alpha(1)=0.5,0.5,0.5 beta(1)=0.5,0.5,0.5  $END
  $BASIS GBASIS=N31 NGAUSS=6 NDFUNC=1 $END
  $SYSTEM TIMLIM=999999100 MWORDS=500 kdiag=1 $END
  $DATA
  {molecule}
  C1
 """)
+                f.write(geom_data)
+                f.write("\n$END\n")
+            
+            logging.info(f"Successfully generated input file for {molecule} at {inp_file}")
+            print(f"Successfully generated {inp_file}")
+
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Failed to run gen_geo.sh for {molecule}. Error: {e}")
+        except IOError as e:
+            logging.error(f"Failed to write to input file for {molecule}. Error: {e}")
+
             f.write(geom_data)
             logging.info(f"Generated input file for {molecule}")
         except subprocess.CalledProcessError as e:
@@ -65,9 +83,21 @@ class JobManager:
 
     def submit_job(self, molecule, params, state):
         """Submit a computational job."""
-        state_dir = f"a1_{params['a1']}_b1_{params['b1']}_a2_{params['a2']}_b2_{params['b2']}_{state}"
+
+        a1 = f"{params['a1']:.2f}"
+        b1 = f"{params['b1']:.2f}"
+        a2 = f"{params['a2']:.2f}"
+        b2 = f"{params['b2']:.2f}"
+
+        state_dir = f"a1_{a1}_b1_{b1}_a2_{a2}_b2_{b2}_{state}"
         inp_file = f"{molecule}_{state_dir}.inp"
+        
+        if not os.path.exists(state_dir):
+            logging.error(f"Job directory does not exist: {state_dir}")
+            return None
+        
         try:
+            logging.info(f"Submitting job for {molecule} in directory {state_dir}")
             job_id = subprocess.check_output(
                 f"gms_sbatch -p r630 -c 30 -i {inp_file}",
                 shell=True,
@@ -76,7 +106,10 @@ class JobManager:
             logging.info(f"Job submitted for {molecule} with ID: {job_id}")
             return job_id
         except subprocess.CalledProcessError as e:
-            logging.error(f"Failed to submit job for {molecule}: {e}")
+            logging.error(f"Failed to submit job for {molecule}. Error: {e}")
+            return None
+        except FileNotFoundError as e:
+            logging.error(f"Job submission failed. Directory not found: {state_dir}")
             return None
 
 
@@ -251,7 +284,7 @@ class Optimizer:
 
     def objective(self, params):
         job_manager = JobManager(self.config['geometry_file'], self.config['optimization']['max_jobs'])
-        extractor = DataExtractor()
+        extractor = DataExtractor(self.config)
         comparator = Comparator()
 
         for molecule in self.config['molecules']:
