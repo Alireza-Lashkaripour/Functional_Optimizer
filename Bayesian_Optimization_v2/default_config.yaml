@@ -1,4 +1,4 @@
-molecules: ["Heptazine", "Cyclazine", "Molecule3"]
+molecules: ["Heptazine", "Cyclazine"]
 geometry_file: geometries.txt
 parameters:
   a1: [0.45, 0.55]
@@ -15,5 +15,5 @@ reference_values:
 optimization:
   max_jobs: 20
   algorithm: tpe
-  max_evals: 250
+  max_evals: 100
 

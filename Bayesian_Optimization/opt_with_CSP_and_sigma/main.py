@@ -79,7 +79,7 @@ def objective(params):
 
 trials = Trials()
 
-best = fmin(objective, space, algo=tpe.suggest, max_evals=1, trials=trials)
+best = fmin(objective, space, algo=tpe.suggest, max_evals=5, trials=trials)
 
 with open('results_summary.txt', 'a') as f:
     f.write(f"\nBest Parameters Found: a1={best_result['params']['a1']}, b1={best_result['params']['b1']}, ")
