@@ -8,13 +8,6 @@ import subprocess
 from time import sleep
 import math
 
-import os
-import subprocess
-from time import sleep
-import csv
-import math
-
-
 def rerun_job(molecule, a1, b1, a2, b2, co, ov, cv, mrmu, mu):
     state_dir = f'a1_{a1}_b1_{b1}_a2_{a2}_b2_{b2}_co_{co}_ov_{ov}_cv_{cv}_mrmu_{mrmu}_mu_{mu}'
     inp_file = f"{molecule}_{state_dir}.inp"
@@ -95,7 +88,7 @@ def extract_log_data(molecules, a1, b1, a2, b2, co, ov, cv, mrmu, mu, job_ids):
                     raise ValueError(f"Job for {molecule} is not completed yet.")
 
                 command = f"./3_read.sh {molecule} {vee_log}"
-                result = subprocess.check_output(command, shell=True, text=True).strip()
+                result = subprocess.check_output(command, shell=True, universal_newlines=True).strip()
                 print(f"[DEBUG] AWK Output: {result}")
 
                 if "has problem" in result:

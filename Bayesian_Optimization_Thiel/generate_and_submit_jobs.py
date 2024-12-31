@@ -59,10 +59,9 @@ def generate_and_submit_jobs(molecules, a1, b1, a2, b2, co, ov, cv, mrmu, mu, ge
  $SYSTEM TIMLIM=999999100 MWORDS=500 kdiag=1 $END
  $DATA
  {molecule}
- C1
 """)
                 f.write(geom_data)
-                f.write(" $END\n")
+                f.write(" \n$END\n")
             print(f"[INFO] Successfully generated input file for {molecule}")
         except Exception as ex:
             print(f"[ERROR] Failed to generate input file for {molecule}: {ex}")
