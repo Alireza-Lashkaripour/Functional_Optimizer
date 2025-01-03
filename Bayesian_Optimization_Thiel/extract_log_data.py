@@ -136,15 +136,22 @@ def extract_log_data(molecules, a1, b1, a2, b2, co, ov, cv, mrmu, mu, job_ids):
 
     return data
 
-
 def save_extracted_data_to_csv(extracted_data, filename='extracted_data.csv'):
     if extracted_data:
-        keys = extracted_data[0].keys()
-        with open(filename, 'w', newline='') as output_file:
-            dict_writer = csv.DictWriter(output_file, fieldnames=keys)
-            dict_writer.writeheader()
-            dict_writer.writerows(extracted_data)
-        print(f"Data successfully saved to {filename}")
+        all_keys = set()
+        for row in extracted_data:
+            all_keys.update(row.keys())
+        
+        fieldnames = list(all_keys)
+
+        try:
+            with open(filename, 'w', newline='') as output_file:
+                dict_writer = csv.DictWriter(output_file, fieldnames=fieldnames)
+                dict_writer.writeheader()
+                dict_writer.writerows(extracted_data)
+            print(f"[INFO] Data successfully saved to {filename}")
+        except Exception as e:
+            print(f"[ERROR] Error saving data to {filename}: {e}")
     else:
         print("[WARNING] No data to save!")
 
