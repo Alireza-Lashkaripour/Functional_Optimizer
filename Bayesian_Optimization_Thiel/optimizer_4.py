@@ -54,7 +54,7 @@ VEE_ref = {
 }
 
 molecules = ["Ethene","E-Butadiene","all-E-Hexatriene","all-E-Octatetraene","Cyclopropene","Cyclopentadiene","Norbornadiene","Benzene","Naphthalene","Furan","Pyrrole","Imidazole","Pyridine","Pyrazine","Pyrimidine","Pyridazine","s-Triazine","s-Tetrazine","Formaldehyde","Acetone","p-Benzoquinone","Formamide","Acetamide","Propanamide","Cytosine","Thymine","Uracil","Adenine"] 
-max_jobs = 84
+max_jobs = 56  # Changed from 84 to 56 as per your request
 
 # --- Utility Functions ---
 def frange(start, stop, step):
@@ -97,6 +97,16 @@ def extract_job_id(job_output):
         return match.group(1)
     return job_output  # Return as-is if pattern not found
 
+def check_job_status(job_id):
+    """Check if a job is still running."""
+    try:
+        # Use squeue to check if job is still in queue
+        result = subprocess.check_output(f"squeue -j {job_id}", shell=True, universal_newlines=True).strip()
+        return job_id in result
+    except subprocess.CalledProcessError:
+        # If squeue returns an error, it likely means the job is not in the queue anymore
+        return False
+
 def wait_for_jobs_to_finish(job_ids, check_interval=30, timeout=3600):
     """Wait for specific jobs to finish."""
     remaining_jobs = job_ids.copy()
@@ -105,18 +115,11 @@ def wait_for_jobs_to_finish(job_ids, check_interval=30, timeout=3600):
     while remaining_jobs and elapsed_time < timeout:
         print(f"Waiting for {len(remaining_jobs)} jobs to complete...")
         for job_id in list(remaining_jobs):
-            try:
-                # Use squeue to check if job is still in queue
-                result = subprocess.check_output(f"squeue -j {job_id}", shell=True, universal_newlines=True).strip()
-                if job_id in result:
-                    print(f"Job {job_id} is still running.")
-                else:
-                    print(f"Job {job_id} has completed.")
-                    remaining_jobs.remove(job_id)
-            except subprocess.CalledProcessError:
-                # If squeue returns an error, it likely means the job is not in the queue anymore
-                print(f"Job {job_id} has completed (not in queue).")
+            if not check_job_status(job_id):
+                print(f"Job {job_id} has completed.")
                 remaining_jobs.remove(job_id)
+            else:
+                print(f"Job {job_id} is still running.")
         
         if remaining_jobs:
             sleep(check_interval)
@@ -129,9 +132,8 @@ def wait_for_jobs_to_finish(job_ids, check_interval=30, timeout=3600):
     
     return [job_id for job_id in job_ids if job_id not in remaining_jobs]
 
-# --- Job Generation and Submission ---
-def generate_and_submit_jobs(molecules, params, geom_file="geometries.txt", max_concurrent_jobs=28):
-    """Generate input files and submit jobs for all molecules."""
+def manage_job_queue(molecules, params, geom_file="geometries.txt", target_concurrent_jobs=56):
+    """Generate input files and submit jobs while maintaining a target number of concurrent jobs."""
     a1, b1, a2, b2, co, ov, cv, mrmu, mu = (
         params['a1'], params['b1'], params['a2'], params['b2'],
         params['co'], params['ov'], params['cv'], params['mrmu'], params['mu']
@@ -142,22 +144,51 @@ def generate_and_submit_jobs(molecules, params, geom_file="geometries.txt", max_
 
     all_job_ids = []
     active_job_ids = []
+    molecule_to_job = {}  # Track which molecule is associated with each job
+    
+    # Setup job queue
+    job_queue = list(molecules)
+    
+    while job_queue or active_job_ids:
+        # First check status of active jobs
+        if active_job_ids:
+            print(f"Checking status of {len(active_job_ids)} active jobs...")
+            completed_jobs = []
+            for job_id in active_job_ids:
+                if not check_job_status(job_id):
+                    print(f"Job {job_id} for molecule {molecule_to_job.get(job_id, 'unknown')} has completed.")
+                    completed_jobs.append(job_id)
+            
+            # Remove completed jobs from active list
+            for job_id in completed_jobs:
+                active_job_ids.remove(job_id)
+        
+        # Submit new jobs if we have capacity and there are jobs in the queue
+        jobs_to_submit = target_concurrent_jobs - len(active_job_ids)
+        
+        if jobs_to_submit > 0 and job_queue:
+            print(f"Submitting {min(jobs_to_submit, len(job_queue))} new jobs...")
+            
+            for _ in range(min(jobs_to_submit, len(job_queue))):
+                if not job_queue:
+                    break
+                    
+                molecule = job_queue.pop(0)
+                
+                inp_file = os.path.join(state_dir, f"{molecule}_{state_dir}.inp")
+                print(f"Generating input file: {inp_file}")
 
-    for molecule in molecules:
-        inp_file = os.path.join(state_dir, f"{molecule}_{state_dir}.inp")
-        print(f"Generating input file: {inp_file}")
+                # Get geometry data
+                geom_data = run_command(f'./gen_geo.sh {molecule} {geom_file}', 
+                                       f"Error getting geometry for {molecule}")
+                if not geom_data:
+                    print(f"ERROR: Geometry data for {molecule} is empty or invalid.")
+                    continue
 
-        # Get geometry data
-        geom_data = run_command(f'./gen_geo.sh {molecule} {geom_file}', 
-                               f"Error getting geometry for {molecule}")
-        if not geom_data:
-            print(f"ERROR: Geometry data for {molecule} is empty or invalid.")
-            continue
-
-        # Create input file
-        try:
-            with open(inp_file, 'w') as f:
-                f.write(f""" $CONTRL SCFTYP=ROHF RUNTYP=energy DFTTYP=camb3lyp ICHARG=0
+                # Create input file
+                try:
+                    with open(inp_file, 'w') as f:
+                        f.write(f""" $CONTRL SCFTYP=ROHF RUNTYP=energy DFTTYP=camb3lyp ICHARG=0
  TDDFT=MRSF MAXIT=200 MULT=3 ISPHER=0 $END
  $TDDFT NSTATE=50 IROOT=1 MULT=1 mralp={a2} mrbet={b2} $END
  $TDDFT spcp(1)={co},{ov},{cv} mrmu={mrmu} tammd=.t. $END
@@ -170,42 +201,47 @@ def generate_and_submit_jobs(molecules, params, geom_file="geometries.txt", max_
  $DATA
  {molecule}
 """)
-                f.write(geom_data)
-                f.write(" \n$END\n")
-        except Exception as e:
-            print(f"ERROR: Failed to create input file for {molecule}: {e}")
-            continue
+                        f.write(geom_data)
+                        f.write(" \n$END\n")
+                except Exception as e:
+                    print(f"ERROR: Failed to create input file for {molecule}: {e}")
+                    continue
 
-        # Submit job
-        try:
-            with DirectoryContext(state_dir):
-                job_submission_command = f"gms_sbatch -p ryzn,r630,r640 -c 28 -i {molecule}_{state_dir}.inp"
-                job_output = run_command(job_submission_command, f"Error submitting job for {molecule}")
-                
-                if job_output:
-                    job_id = extract_job_id(job_output)
-                    if job_id:
-                        print(f"Job submitted for {molecule} with ID: {job_id}")
-                        all_job_ids.append(job_id)
-                        active_job_ids.append(job_id)
-                    else:
-                        print(f"ERROR: Failed to extract job ID from output: {job_output}")
-                else:
-                    print(f"ERROR: Failed to get job submission output for {molecule}")
-        except Exception as e:
-            print(f"ERROR: Exception during job submission for {molecule}: {e}")
-            continue
-
-        # Check if we've reached max concurrent jobs
-        if len(active_job_ids) >= max_concurrent_jobs:
-            print(f"Reached max concurrent jobs limit ({max_concurrent_jobs}). Waiting for jobs to complete...")
-            completed_jobs = wait_for_jobs_to_finish(active_job_ids)
-            active_job_ids = [job_id for job_id in active_job_ids if job_id not in completed_jobs]
-
-    # Wait for any remaining jobs
-    if active_job_ids:
-        wait_for_jobs_to_finish(active_job_ids)
-
+                # Submit job
+                try:
+                    with DirectoryContext(state_dir):
+                        job_submission_command = f"gms_sbatch -p ryzn,r630,r640 -c 28 -i {molecule}_{state_dir}.inp"
+                        job_output = run_command(job_submission_command, f"Error submitting job for {molecule}")
+                        
+                        if job_output:
+                            job_id = extract_job_id(job_output)
+                            if job_id:
+                                print(f"Job submitted for {molecule} with ID: {job_id}")
+                                all_job_ids.append(job_id)
+                                active_job_ids.append(job_id)
+                                molecule_to_job[job_id] = molecule
+                            else:
+                                print(f"ERROR: Failed to extract job ID from output: {job_output}")
+                                # Put the molecule back in queue if submission failed
+                                job_queue.append(molecule)
+                        else:
+                            print(f"ERROR: Failed to get job submission output for {molecule}")
+                            # Put the molecule back in queue if submission failed
+                            job_queue.append(molecule)
+                except Exception as e:
+                    print(f"ERROR: Exception during job submission for {molecule}: {e}")
+                    # Put the molecule back in queue if submission failed
+                    job_queue.append(molecule)
+                    continue
+        
+        # If we have pending jobs but we're under the target number, sleep for a bit before checking again
+        if job_queue or active_job_ids:
+            print(f"Current status: {len(active_job_ids)} active jobs, {len(job_queue)} jobs in queue.")
+            if not job_queue or len(active_job_ids) >= target_concurrent_jobs:
+                print("Sleeping for 30 seconds before checking job status again...")
+                sleep(30)
+    
+    print("All jobs have been submitted and completed.")
     return all_job_ids
 
 # --- Data Extraction Functions ---
@@ -215,9 +251,6 @@ def extract_log_data(molecules, params, job_ids):
         params['a1'], params['b1'], params['a2'], params['b2'],
         params['co'], params['ov'], params['cv'], params['mrmu'], params['mu']
     )
-    
-    # Ensure all jobs have completed
-    wait_for_jobs_to_finish(job_ids)
     
     state_dir = f'a1_{a1}_b1_{b1}_a2_{a2}_b2_{b2}_co_{co}_ov_{ov}_cv_{cv}_mrmu_{mrmu}_mu_{mu}'
     data = []
@@ -434,8 +467,8 @@ def objective(params):
     params = round_params(params)
     print(f"Evaluating parameter set: {params}")
     
-    # Generate and submit jobs
-    job_ids = generate_and_submit_jobs(molecules, params, max_concurrent_jobs=max_jobs)
+    # Generate and submit jobs with continuous job queue management
+    job_ids = manage_job_queue(molecules, params, target_concurrent_jobs=max_jobs)
     
     # Extract data from log files
     extracted_data = extract_log_data(molecules, params, job_ids)
@@ -496,7 +529,7 @@ if __name__ == "__main__":
     parser.add_argument('--max-evals', type=int, default=2500, help='Maximum number of evaluations')
     parser.add_argument('--molecules', nargs='+', default = ["Ethene","E-Butadiene","all-E-Hexatriene","all-E-Octatetraene","Cyclopropene","Cyclopentadiene","Norbornadiene","Benzene","Naphthalene","Furan","Pyrrole","Imidazole","Pyridine","Pyrazine","Pyrimidine","Pyridazine","s-Triazine","s-Tetrazine","Formaldehyde","Acetone","p-Benzoquinone","Formamide","Acetamide","Propanamide","Cytosine","Thymine","Uracil","Adenine"], 
                         help='List of molecules to optimize parameters for')
-    parser.add_argument('--max-jobs', type=int, default=84, help='Maximum number of concurrent jobs')
+    parser.add_argument('--max-jobs', type=int, default=56, help='Maximum number of concurrent jobs')
     
     args = parser.parse_args()
     
