@@ -1,0 +1,577 @@
+#!/usr/bin/env python3
+
+import os
+import re
+import csv
+import math
+import subprocess
+from time import sleep
+from hyperopt import fmin, tpe, hp, STATUS_OK, Trials
+
+# --- Parameter Space Definition ---
+space = {
+    'a1': hp.uniform('a1', 0.40, 0.75),
+    'b1': hp.uniform('b1', -0.35, -0.15),
+    'a2': hp.uniform('a2', 0.40, 0.75),
+    'b2': hp.uniform('b2', -0.30, -0.05),
+    'co': hp.uniform('co', 0.40, 0.75),
+    'ov': hp.uniform('ov', 0.40, 0.75),
+    'cv': hp.uniform('cv', 0.40, 0.75),
+    'mrmu': hp.uniform('mrmu', 0.25, 0.40),
+    'mu': hp.uniform('mu', 0.25, 0.40),
+}
+
+# --- Reference Data ---
+VEE_ref = {
+    "Ethene": [7.8],
+    "E-Butadiene": [6.18, 6.55],
+    "all-E-Hexatriene": [5.10, 5.09],
+    "all-E-Octatetraene": [4.47, 4.66],
+    "Cyclopropene": [6.76, 7.06],
+    "Cyclopentadiene": [5.55, 6.31],
+    "Norbornadiene": [5.34, 6.11],
+    "Benzene": [5.08, 6.54, 7.13, 8.41],
+    "Naphthalene": [4.24, 4.77, 5.90, 6.00, 6.07, 6.48, 6.33, 6.71],
+    "Furan": [6.32, 6.57, 8.13],
+    "Pyrrole": [6.37, 6.57, 7.91],
+    "Imidazole": [6.81, 6.19, 6.93],
+    "Pyridine": [4.85, 4.59, 5.11, 6.26, 7.18, 7.27],
+    "Pyrazine": [3.95, 4.81, 4.64, 5.56, 6.60, 6.58, 7.72, 7.60],
+    "Pyrimidine": [4.55, 4.91, 5.44, 6.95],
+    "Pyridazine": [3.78, 4.32, 5.18, 5.77],
+    "s-Triazine": [4.60, 4.66, 4.71, 5.79],
+    "s-Tetrazine": [2.24, 3.48, 4.73, 4.91, 5.18, 5.79, 5.47],
+    "Formaldehyde": [3.88, 9.1, 9.3],
+    "Acetone": [4.40, 9.1, 9.4],
+    "p-Benzoquinone": [2.80, 2.78, 4.25, 5.29, 5.60, 6.98],
+    "Formamide": [5.63, 7.44],
+    "Acetamide": [5.80, 7.27],
+    "Propanamide": [5.72, 7.20],
+    "Cytosine": [4.66, 4.87, 5.26, 5.62],
+    "Thymine": [4.82, 5.20, 6.27, 6.16, 6.53],
+    "Uracil": [4.80, 5.35, 6.26, 6.10, 6.56, 6.70],
+    "Adenine": [5.25, 5.25, 5.12, 5.75]
+}
+
+molecules = ["Ethene","E-Butadiene","all-E-Hexatriene","all-E-Octatetraene","Cyclopropene","Cyclopentadiene","Norbornadiene","Benzene","Naphthalene","Furan","Pyrrole","Imidazole","Pyridine","Pyrazine","Pyrimidine","Pyridazine","s-Triazine","s-Tetrazine","Formaldehyde","Acetone","p-Benzoquinone","Formamide","Acetamide","Propanamide","Cytosine","Thymine","Uracil","Adenine"] 
+max_jobs = 56  # Maximum concurrent jobs
+
+# --- Utility Functions ---
+def frange(start, stop, step):
+    """Generate a range of float values."""
+    while start <= stop:
+        yield round(start, 2)
+        start += step
+
+def run_command(command, error_message):
+    """Execute a shell command and handle errors."""
+    try:
+        output = subprocess.check_output(command, shell=True, universal_newlines=True).strip()
+        return output
+    except subprocess.CalledProcessError as e:
+        print(f"{error_message}: {e.output if hasattr(e, 'output') else str(e)}")
+        return None
+
+class DirectoryContext:
+    """Context manager for changing directories."""
+    def __init__(self, path):
+        self.path = path
+        self.original_dir = os.getcwd()
+
+    def __enter__(self):
+        os.chdir(self.path)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        os.chdir(self.original_dir)
+
+# --- Job Management Functions ---
+def extract_job_id(job_output):
+    """Extract actual job ID from job submission output."""
+    if not job_output:
+        return None
+    
+    # Match pattern like "Submitted batch job 4413155"
+    match = re.search(r'Submitted batch job (\d+)', job_output)
+    if match:
+        return match.group(1)
+    return job_output  # Return as-is if pattern not found
+
+def check_job_status(job_id):
+    """Check if a job is still running."""
+    try:
+        # Use squeue to check if job is still in queue
+        result = subprocess.check_output(f"squeue -j {job_id}", shell=True, universal_newlines=True).strip()
+        return job_id in result
+    except subprocess.CalledProcessError:
+        # If squeue returns an error, it likely means the job is not in the queue anymore
+        return False
+
+def count_running_jobs():
+    """Count total number of user's running jobs."""
+    try:
+        result = subprocess.check_output("squeue -u $USER | wc -l", shell=True, universal_newlines=True).strip()
+        # Subtract 1 for the header line
+        count = int(result) - 1
+        return max(0, count)  # Ensure non-negative
+    except (subprocess.CalledProcessError, ValueError):
+        print("Warning: Could not count running jobs, assuming none are running.")
+        return 0
+
+def generate_input_file(molecule, params, state_dir, geom_file):
+    """Generate input file for a molecule with given parameters."""
+    a1, b1, a2, b2, co, ov, cv, mrmu, mu = (
+        params['a1'], params['b1'], params['a2'], params['b2'],
+        params['co'], params['ov'], params['cv'], params['mrmu'], params['mu']
+    )
+    
+    inp_file = os.path.join(state_dir, f"{molecule}_{state_dir}.inp")
+    print(f"Generating input file: {inp_file}")
+
+    # Get geometry data
+    geom_data = run_command(f'./gen_geo.sh {molecule} {geom_file}', 
+                           f"Error getting geometry for {molecule}")
+    if not geom_data:
+        print(f"ERROR: Geometry data for {molecule} is empty or invalid.")
+        return None
+
+    # Create input file
+    try:
+        with open(inp_file, 'w') as f:
+            f.write(f""" $CONTRL SCFTYP=ROHF RUNTYP=energy DFTTYP=camb3lyp ICHARG=0
+ TDDFT=MRSF MAXIT=200 MULT=3 ISPHER=0 $END
+ $TDDFT NSTATE=50 IROOT=1 MULT=1 mralp={a2} mrbet={b2} $END
+ $TDDFT spcp(1)={co},{ov},{cv} mrmu={mrmu} tammd=.t. $END
+ $DFT alphac={a1} betac={b1} mu={mu} $END
+ $SCF DIRSCF=.t. diis=.f. damp=.t.
+  soscf=.t. shift=.t. couple=.t.
+  alpha(1)=0.5,0.5,0.5 beta(1)=0.5,0.5,0.5 $END
+ $BASIS GBASIS=N31 NGAUSS=6 NDFUNC=1 $END
+ $SYSTEM TIMLIM=999999100 MWORDS=500 kdiag=1 $END
+ $DATA
+ {molecule}
+""")
+            f.write(geom_data)
+            f.write(" \n$END\n")
+        return inp_file
+    except Exception as e:
+        print(f"ERROR: Failed to create input file for {molecule}: {e}")
+        return None
+
+def submit_job(molecule, inp_file, state_dir):
+    """Submit a job and return job ID if successful."""
+    try:
+        with DirectoryContext(state_dir):
+            job_submission_command = f"gms_sbatch -p ryzn,r630,r640 -c 28 -i {os.path.basename(inp_file)}"
+            job_output = run_command(job_submission_command, f"Error submitting job for {molecule}")
+            
+            if job_output:
+                job_id = extract_job_id(job_output)
+                if job_id:
+                    print(f"Job submitted for {molecule} with ID: {job_id}")
+                    return job_id
+                else:
+                    print(f"ERROR: Failed to extract job ID from output: {job_output}")
+            else:
+                print(f"ERROR: Failed to get job submission output for {molecule}")
+    except Exception as e:
+        print(f"ERROR: Exception during job submission for {molecule}: {e}")
+    
+    return None
+
+def optimize_job_queue(molecules, params, geom_file="geometries.txt", target_concurrent_jobs=56):
+    """
+    Maintain a pool of jobs running concurrently at the target level.
+    This function is designed to maximize throughput by keeping the cluster busy.
+    """
+    a1, b1, a2, b2, co, ov, cv, mrmu, mu = (
+        params['a1'], params['b1'], params['a2'], params['b2'],
+        params['co'], params['ov'], params['cv'], params['mrmu'], params['mu']
+    )
+    
+    state_dir = f'a1_{a1}_b1_{b1}_a2_{a2}_b2_{b2}_co_{co}_ov_{ov}_cv_{cv}_mrmu_{mrmu}_mu_{mu}'
+    os.makedirs(state_dir, exist_ok=True)
+
+    # Setup job tracking
+    all_job_ids = []        # All jobs submitted for this parameter set
+    active_job_info = {}    # job_id -> {'molecule': name, 'completed': bool}
+    processed_molecules = set()  # Track which molecules have been processed
+    
+    # Create molecule queue (make a copy to avoid modifying the original)
+    molecule_queue = list(molecules)
+    
+    print(f"Starting optimization with {len(molecule_queue)} molecules in queue")
+    print(f"Target concurrent jobs: {target_concurrent_jobs}")
+    
+    # Continue until all molecules have been processed
+    while molecule_queue or active_job_info:
+        # Check status of active jobs
+        current_running_jobs = 0
+        completed_jobs = []
+        
+        for job_id, info in active_job_info.items():
+            if not info['completed']:
+                if check_job_status(job_id):
+                    current_running_jobs += 1
+                else:
+                    print(f"Job {job_id} for molecule {info['molecule']} has completed.")
+                    info['completed'] = True
+                    completed_jobs.append(job_id)
+                    processed_molecules.add(info['molecule'])
+        
+        # Update job tracking
+        for job_id in completed_jobs:
+            active_job_info[job_id]['completed'] = True
+        
+        # Calculate how many new jobs we can submit
+        available_slots = target_concurrent_jobs - current_running_jobs
+        
+        print(f"Status: {current_running_jobs} running jobs, {len(molecule_queue)} molecules in queue, {available_slots} available slots")
+        
+        # Submit new jobs if we have capacity and molecules in queue
+        if available_slots > 0 and molecule_queue:
+            jobs_to_submit = min(available_slots, len(molecule_queue))
+            print(f"Submitting {jobs_to_submit} new jobs...")
+            
+            for _ in range(jobs_to_submit):
+                if not molecule_queue:
+                    break
+                
+                molecule = molecule_queue.pop(0)
+                
+                # Generate input file
+                inp_file = generate_input_file(molecule, params, state_dir, geom_file)
+                if not inp_file:
+                    print(f"Failed to generate input file for {molecule}, skipping.")
+                    continue
+                
+                # Submit job
+                job_id = submit_job(molecule, inp_file, state_dir)
+                if job_id:
+                    all_job_ids.append(job_id)
+                    active_job_info[job_id] = {'molecule': molecule, 'completed': False}
+                else:
+                    print(f"Failed to submit job for {molecule}, putting back in queue.")
+                    molecule_queue.append(molecule)
+        
+        # If we still have pending jobs or molecules in queue, wait a bit before checking again
+        if active_job_info or molecule_queue:
+            sleep_time = 30 if active_job_info else 5
+            print(f"Sleeping for {sleep_time} seconds before next check...")
+            sleep(sleep_time)
+        else:
+            print("All jobs completed!")
+            break
+    
+    # Ensure all jobs have completed before returning
+    pending_jobs = [job_id for job_id, info in active_job_info.items() if not info['completed']]
+    if pending_jobs:
+        print(f"Waiting for final {len(pending_jobs)} jobs to complete...")
+        for job_id in pending_jobs:
+            molecule = active_job_info[job_id]['molecule']
+            print(f"Waiting for job {job_id} ({molecule})...")
+            while check_job_status(job_id):
+                sleep(30)
+            print(f"Job {job_id} ({molecule}) has completed.")
+            active_job_info[job_id]['completed'] = True
+            processed_molecules.add(active_job_info[job_id]['molecule'])
+    
+    print(f"All {len(processed_molecules)} molecules processed successfully!")
+    return all_job_ids
+
+def extract_log_data(molecules, params, job_ids):
+    """Extract VEE data from log files for all molecules."""
+    a1, b1, a2, b2, co, ov, cv, mrmu, mu = (
+        params['a1'], params['b1'], params['a2'], params['b2'],
+        params['co'], params['ov'], params['cv'], params['mrmu'], params['mu']
+    )
+    
+    state_dir = f'a1_{a1}_b1_{b1}_a2_{a2}_b2_{b2}_co_{co}_ov_{ov}_cv_{cv}_mrmu_{mrmu}_mu_{mu}'
+    data = []
+
+    for molecule in molecules:
+        vee_log = os.path.join(state_dir, f"{molecule}_{state_dir}.log")
+        print(f"Processing molecule: {molecule}")
+        
+        retry_count = 0
+        while retry_count < 2:
+            try:
+                if not os.path.exists(vee_log):
+                    raise FileNotFoundError(f"Log file not found: {vee_log}")
+                
+                # Check file size to make sure it's not empty
+                if os.path.getsize(vee_log) == 0:
+                    raise ValueError(f"Log file for {molecule} is empty")
+                
+                # Check job completion
+                with open(vee_log, 'r') as log:
+                    content = log.read()
+                    job_completed = ("CPU timing information for all processes" in content or 
+                                    "ddikick.x: exited gracefully." in content)
+                
+                if not job_completed:
+                    raise ValueError(f"Job for {molecule} is not completed yet.")
+
+                # Extract VEE values using 3_read.sh
+                command = f"./3_read.sh {molecule} {vee_log}"
+                result = run_command(command, f"Error processing {molecule} log file")
+                print(f"AWK Output: {result}")
+
+                if not result:
+                    raise ValueError(f"No output from processing {molecule} log file")
+                
+                if "has problem" in result:
+                    raise ValueError(f"SCF convergence issue detected for {molecule}")
+
+                # Parse AWK output for VEE values
+                extracted_values = []
+                for line in result.splitlines():
+                    parts = line.split()
+                    if len(parts) == 2:
+                        mol_name, vee = parts
+                        try:
+                            extracted_values.append(float(vee))
+                        except ValueError:
+                            print(f"WARNING: Could not convert '{vee}' to float for {molecule}")
+
+                if not extracted_values:
+                    raise ValueError(f"No valid VEE values found for {molecule}")
+
+                # Create data entry
+                molecule_data = {
+                    "molecule": molecule,
+                    "a1": a1, "b1": b1, "a2": a2, "b2": b2,
+                    "co": co, "ov": ov, "cv": cv, "mrmu": mrmu, "mu": mu,
+                }
+
+                for idx, vee in enumerate(extracted_values):
+                    molecule_data[f"VEE_{idx + 1}"] = vee
+
+                data.append(molecule_data)
+                print(f"Successfully extracted VEE data for {molecule}: {extracted_values}")
+                break
+                
+            except (ValueError, FileNotFoundError, subprocess.CalledProcessError) as e:
+                print(f"ERROR: {e}")
+                retry_count += 1
+                
+                if retry_count < 2:
+                    print(f"Retrying job for {molecule}...")
+                    # Resubmit job
+                    with DirectoryContext(state_dir):
+                        job_submission_command = f"gms_sbatch -p chc4,xeon,trpro,r630,r640,ryzn -c 28 -i {molecule}_{state_dir}.inp"
+                        job_output = run_command(job_submission_command, f"Error resubmitting job for {molecule}")
+                        if job_output:
+                            job_id = extract_job_id(job_output)
+                            if job_id:
+                                print(f"Job resubmitted with ID: {job_id}")
+                                while check_job_status(job_id):
+                                    print(f"Waiting for resubmitted job {job_id} to complete...")
+                                    sleep(30)
+                            else:
+                                print(f"ERROR: Failed to extract job ID from output: {job_output}")
+                        else:
+                            print(f"ERROR: Failed to get job submission output")
+                else:
+                    print(f"Skipping molecule {molecule} after failed retries.")
+                    break
+
+    return data
+
+# --- Data Analysis Functions ---
+def compare_with_reference(extracted_data, reference_data):
+    """Compare calculated VEE values with reference data."""
+    comparison = []
+    valid_differences = []
+    skipped_molecules = []
+
+    for entry in extracted_data:
+        molecule = entry['molecule']
+        try:
+            vees = [float(value) for key, value in entry.items() if key.startswith('VEE_')]
+            ref_values = reference_data.get(molecule, [])
+
+            if not ref_values:
+                print(f"WARNING: No reference values found for molecule {molecule}")
+                skipped_molecules.append(molecule)
+                continue
+
+            for idx, vee in enumerate(vees):
+                if idx < len(ref_values):
+                    ref_vee = ref_values[idx]
+                    vee_diff = vee - ref_vee
+                    comparison.append({
+                        'molecule': molecule,
+                        f'VEE_{idx + 1}_calculated': vee,
+                        f'VEE_{idx + 1}_reference': ref_vee,
+                        f'VEE_{idx + 1}_diff': vee_diff
+                    })
+                    valid_differences.append(abs(vee_diff))  # Use absolute difference for metrics
+                else:
+                    print(f"WARNING: Extra VEE value found for molecule {molecule}: {vee}")
+
+        except ValueError as e:
+            print(f"ERROR: Could not convert VEE values to float for molecule {molecule}: {e}")
+            skipped_molecules.append(molecule)
+            continue
+
+    print(f"INFO: Skipped {len(skipped_molecules)} molecules due to missing reference values or errors.")
+    return comparison, valid_differences
+
+def calculate_rmse_mae(differences):
+    """Calculate RMSE and MAE from differences."""
+    if not differences:
+        print("No valid differences for RMSE/MAE calculation.")
+        return None, None
+
+    mse = sum(diff ** 2 for diff in differences) / len(differences)
+    rmse = math.sqrt(mse)
+    mae = sum(differences) / len(differences)
+
+    return rmse, mae
+
+# --- Results Saving Functions ---
+def save_extracted_data_to_csv(extracted_data, filename='extracted_data.csv'):
+    """Save extracted data to CSV file."""
+    if not extracted_data:
+        print("WARNING: No data to save!")
+        return
+
+    all_keys = set()
+    for row in extracted_data:
+        all_keys.update(row.keys())
+    
+    fieldnames = sorted(list(all_keys))
+
+    try:
+        with open(filename, 'w', newline='') as output_file:
+            dict_writer = csv.DictWriter(output_file, fieldnames=fieldnames)
+            dict_writer.writeheader()
+            dict_writer.writerows(extracted_data)
+        print(f"INFO: Data successfully saved to {filename}")
+    except Exception as e:
+        print(f"ERROR: Failed to save data to {filename}: {e}")
+
+def save_comparison_results_to_csv(comparison_data, filename='comparison_results.csv'):
+    """Save comparison results to CSV file."""
+    if not comparison_data:
+        print("No comparison data to save.")
+        return
+        
+    keys = comparison_data[0].keys() if comparison_data else []
+    try:
+        with open(filename, 'w', newline='') as output_file:
+            dict_writer = csv.DictWriter(output_file, fieldnames=keys)
+            dict_writer.writeheader()
+            dict_writer.writerows(comparison_data)
+        print(f"Comparison data successfully saved to {filename}")
+    except Exception as e:
+        print(f"Error saving data to {filename}: {e}")
+
+def save_results_summary(params, rmse, mae, comparison_results, filename='results_summary.txt'):
+    """Save optimization results summary to a text file."""
+    with open(filename, 'a') as f:
+        f.write(
+            f"Combination: a1={params['a1']:.2f}, b1={params['b1']:.2f}, a2={params['a2']:.2f}, "
+            f"b2={params['b2']:.2f}, co={params['co']:.2f}, ov={params['ov']:.2f}, "
+            f"cv={params['cv']:.2f}, mrmu={params['mrmu']:.2f}, mu={params['mu']:.2f}\n"
+        )
+        f.write(f"RMSE: {rmse:.4f}, MAE: {mae:.4f}\n")
+        f.write("Per-molecule differences:\n")
+        
+        for result in comparison_results:
+            molecule = result.get('molecule', 'Unknown')
+            vee_diffs = []
+            for key, value in result.items():
+                if key.startswith('VEE_') and key.endswith('_diff'):
+                    vee_diffs.append(f"{key}={value:.4f}")
+            if vee_diffs:
+                f.write(f"{molecule}: {', '.join(vee_diffs)}\n")
+            else:
+                f.write(f"{molecule}: No VEE differences found\n")
+        
+        f.write("\n")  # Add blank line between entries
+
+# --- Optimization Functions ---
+def round_params(params):
+    """Round parameter values to 2 decimal places."""
+    return {key: round(value, 2) for key, value in params.items()}
+
+def objective(params):
+    """Objective function for Bayesian optimization."""
+    # Round parameters to 2 decimal places
+    params = round_params(params)
+    print(f"Evaluating parameter set: {params}")
+    
+    # Generate and submit jobs with optimized job queue management
+    job_ids = optimize_job_queue(molecules, params, target_concurrent_jobs=max_jobs)
+    
+    # Extract data from log files
+    extracted_data = extract_log_data(molecules, params, job_ids)
+    save_extracted_data_to_csv(extracted_data)
+    
+    # Compare with reference data
+    comparison_results, valid_differences = compare_with_reference(extracted_data, VEE_ref)
+    save_comparison_results_to_csv(comparison_results)
+    
+    # Calculate metrics
+    rmse, mae = calculate_rmse_mae(valid_differences)
+    
+    if rmse is not None and mae is not None:
+        print(f"RMSE: {rmse:.4f}, MAE: {mae:.4f}")
+        save_results_summary(params, rmse, mae, comparison_results)
+        return {'loss': rmse, 'status': STATUS_OK, 'mae': mae}
+    else:
+        print("Skipping combination due to invalid VEE differences.")
+        return {'loss': float('inf'), 'status': STATUS_OK}
+
+# --- Main Function ---
+def main(max_evals=10):
+    """Main function to run Bayesian optimization."""
+    trials = Trials()
+    
+    best = fmin(
+        fn=objective,
+        space=space,
+        algo=tpe.suggest,
+        max_evals=max_evals,
+        trials=trials
+    )
+    
+    # Round and print best parameters
+    best_params = round_params({k: v for k, v in best.items()})
+    print("\nOptimization completed.")
+    print(f"Best parameters found: {best_params}")
+    
+    # Print best result
+    best_trial_idx = trials.best_trial['tid']
+    best_loss = trials.results[best_trial_idx]['loss']
+    best_mae = trials.results[best_trial_idx].get('mae', 'N/A')
+    
+    print(f"Best RMSE: {best_loss:.4f}")
+    print(f"Best MAE: {best_mae}")
+    
+    with open('best_params.txt', 'w') as f:
+        f.write(f"Best parameters found:\n")
+        for k, v in best_params.items():
+            f.write(f"{k} = {v:.2f}\n")
+        f.write(f"Best RMSE: {best_loss:.4f}\n")
+        f.write(f"Best MAE: {best_mae}\n")
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Run Bayesian optimization for VEE functional parameters.')
+    parser.add_argument('--max-evals', type=int, default=2500, help='Maximum number of evaluations')
+    parser.add_argument('--molecules', nargs='+', default=molecules, 
+                        help='List of molecules to optimize parameters for')
+    parser.add_argument('--max-jobs', type=int, default=56, help='Maximum number of concurrent jobs')
+    
+    args = parser.parse_args()
+    
+    # Update global variables
+    molecules = args.molecules
+    max_jobs = args.max_jobs
+    
+    # Run optimization
+    main(max_evals=args.max_evals)
